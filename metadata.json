@@ -1,0 +1,7 @@
+{
+  "name": "PhishGuard AI",
+  "description": "An advanced AI-powered phishing detection and analysis system that identifies malicious URLs and suspicious email content using deep reasoning.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
