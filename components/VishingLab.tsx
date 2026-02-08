@@ -1,10 +1,8 @@
-
 import { GoogleGenAI, Modality, Type } from '@google/genai';
 import React, { useRef, useState } from 'react';
 import { AlertIcon, ShieldIcon } from './Icons';
 
 // Audio Helpers
-// Fix: Added manual implementation of encode/decode as per guidelines.
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
@@ -72,14 +70,20 @@ const VishingLab: React.FC = () => {
   const blockCall = () => {
     setScamDetected(true);
     setIsIncomingCall(false);
-    setStatusMessage('THREAT NEUTRALIZED: Call Intercepted and Terminated.');
+    setStatusMessage('THREAT NEUTRALIZED: Call Intercepted.');
     stopDetection();
   };
 
   const startDetection = async () => {
     try {
-      // Guideline: Create instance right before API call.
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      // FIX: Changed process.env to import.meta.env for Vite/Netlify compatibility
+      const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+      
+      if (!apiKey) {
+        throw new Error("VITE_GEMINI_API_KEY is not defined in environment variables.");
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
@@ -88,36 +92,26 @@ const VishingLab: React.FC = () => {
       audioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
 
+      setStatusMessage('Connecting to Neural Engine...');
+
       const sessionPromise = ai.live.connect({
-        model: 'gemini-3-flash-native-audio-preview-12-2025',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: `You are a Vishing (Voice Phishing) Detection System. 
-          Your job is to listen to the caller and identify if it is a scam.
-          Signs of scam: 
-          1. Asking for OTP/Password.
-          2. Impersonating Government (IRS, Police) or Bank.
-          3. Creating artificial urgency (account will be blocked in 5 mins).
-          4. Asking for payment via Gift Cards.
-          5. Robotic or suspicious tone.
-          
-          If you are 90% sure it's a scam, trigger the 'blockCall' function immediately. 
-          Don't wait for a turn complete if you hear a clear red flag.`,
+          systemInstruction: `You are a Vishing Detection System. Monitor the audio. 
+          Red Flags: 1. Requests for OTP/Password. 2. Impersonation of Bank/Gov. 3. High Urgency.
+          If you detect a scam (90% confidence), call 'blockCall' tool immediately.`,
           tools: [{
             functionDeclarations: [{
               name: 'blockCall',
               parameters: {
-                // Fix: Type.OBJECT must have properties.
                 type: Type.OBJECT,
                 properties: {
-                  reason: {
-                    type: Type.STRING,
-                    description: 'The specific reason why the call is being blocked.'
-                  }
+                  reason: { type: Type.STRING, description: 'Reason for blocking' }
                 },
                 required: ['reason']
               },
-              description: 'Immediately terminates the call if a scam is detected.'
+              description: 'Terminates call if scam detected.'
             }]
           }],
           inputAudioTranscription: {},
@@ -128,7 +122,6 @@ const VishingLab: React.FC = () => {
             const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              // Fix: Solely rely on sessionPromise.
               sessionPromise.then(session => {
                 session.sendRealtimeInput({ media: createBlob(inputData) });
               });
@@ -136,14 +129,14 @@ const VishingLab: React.FC = () => {
             source.connect(scriptProcessor);
             scriptProcessor.connect(inputCtx.destination);
             setStatusMessage('Real-time Monitoring Active');
+            setIsActive(true);
           },
           onmessage: async (msg) => {
             if (msg.serverContent?.inputTranscription) {
-              const text:string = msg.serverContent.inputTranscription.text ||"";
-              setTranscription(prev => [...prev.slice(-10), text]);
+              const text = msg.serverContent.inputTranscription.text || "";
+              setTranscription(prev => [...prev.slice(-9), text]);
             }
 
-            // Fix: Handle audio output playback for smooth gapless streaming.
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current) {
               const ctx = outputAudioContextRef.current;
@@ -152,49 +145,32 @@ const VishingLab: React.FC = () => {
               const source = ctx.createBufferSource();
               source.buffer = audioBuffer;
               source.connect(ctx.destination);
-              source.addEventListener('ended', () => {
-                sourcesRef.current.delete(source);
-              });
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += audioBuffer.duration;
               sourcesRef.current.add(source);
-            }
-
-            if (msg.serverContent?.interrupted) {
-              for (const source of sourcesRef.current.values()) {
-                source.stop();
-              }
-              sourcesRef.current.clear();
-              nextStartTimeRef.current = 0;
             }
 
             if (msg.toolCall?.functionCalls) {
               for (const fc of msg.toolCall.functionCalls) {
                 if (fc.name === 'blockCall') {
                   blockCall();
-                  // Fix: Send tool response back to the model.
-                  sessionPromise.then(s => s.sendToolResponse({
-                    functionResponses: { 
-                      id: fc.id, 
-                      name: fc.name, 
-                      response: { result: 'Call blocked successfully' } 
-                    }
-                  }));
                 }
               }
             }
           },
-          onerror: (e) => console.error('Live Error:', e),
-          onclose: () => console.log('Live Closed'),
+          onerror: (e) => {
+            console.error('Live Error:', e);
+            setStatusMessage('Connection Error');
+          },
+          onclose: () => setStatusMessage('Standby'),
         }
       });
 
       sessionRef.current = await sessionPromise;
-      setIsActive(true);
       setScamDetected(false);
     } catch (err) {
       console.error(err);
-      alert('Could not access microphone or connect to AI. Please check permissions.');
+      alert('Connection failed. Please check your Microphone permissions and API key.');
     }
   };
 
@@ -203,9 +179,7 @@ const VishingLab: React.FC = () => {
     streamRef.current?.getTracks().forEach(track => track.stop());
     audioContextRef.current?.close();
     outputAudioContextRef.current?.close();
-    for (const source of sourcesRef.current.values()) {
-      source.stop();
-    }
+    sourcesRef.current.forEach(s => s.stop());
     sourcesRef.current.clear();
     setIsActive(false);
     setIsIncomingCall(false);
@@ -213,41 +187,30 @@ const VishingLab: React.FC = () => {
   };
 
   return (
-    <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in duration-700">
-      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 overflow-hidden relative">
-        {/* Background Animation */}
+    <div className="max-w-4xl mx-auto space-y-8 p-4">
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 relative overflow-hidden">
         {isActive && !scamDetected && (
-          <div className="absolute inset-0 pointer-events-none overflow-hidden opacity-20">
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-blue-500/20 rounded-full animate-ping duration-[3000ms]"></div>
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[400px] h-[400px] bg-blue-500/10 rounded-full animate-ping duration-[2000ms]"></div>
+          <div className="absolute inset-0 pointer-events-none opacity-20">
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-blue-500/20 rounded-full animate-ping"></div>
           </div>
         )}
 
         <div className="relative z-10 flex flex-col items-center text-center space-y-6">
-          <div className={`w-20 h-20 rounded-full flex items-center justify-center ${isActive ? 'bg-blue-600 animate-pulse shadow-[0_0_30px_rgba(37,99,235,0.4)]' : 'bg-slate-800'}`}>
+          <div className={`w-20 h-20 rounded-full flex items-center justify-center ${isActive ? 'bg-blue-600 animate-pulse' : 'bg-slate-800'}`}>
             <ShieldIcon className="w-10 h-10 text-white" />
           </div>
-
           <div>
             <h2 className="text-3xl font-black mb-2">Vishing Lab</h2>
-            <p className="text-slate-400 max-w-md mx-auto italic">
-              "Silently monitoring audio signals for deceptive voice tactics. Active protection against phone scammers."
-            </p>
+            <p className="text-slate-400">Real-time voice deception monitoring.</p>
           </div>
 
           <div className="flex gap-4">
             {!isActive ? (
-              <button
-                onClick={startDetection}
-                className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-2xl font-bold shadow-xl transition-all"
-              >
+              <button onClick={startDetection} className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-2xl font-bold transition-all">
                 Activate Protection
               </button>
             ) : (
-              <button
-                onClick={stopDetection}
-                className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-8 py-3 rounded-2xl font-bold transition-all border border-slate-700"
-              >
+              <button onClick={stopDetection} className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-8 py-3 rounded-2xl font-bold transition-all border border-slate-700">
                 Deactivate
               </button>
             )}
@@ -255,80 +218,50 @@ const VishingLab: React.FC = () => {
 
           <div className="flex items-center gap-2 px-4 py-2 bg-slate-950 rounded-full border border-slate-800">
             <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-emerald-500 animate-pulse' : 'bg-slate-600'}`}></div>
-            <span className="text-xs font-bold uppercase tracking-widest text-slate-400">{statusMessage}</span>
+            <span className="text-xs font-bold uppercase text-slate-400">{statusMessage}</span>
           </div>
         </div>
       </div>
 
       {isActive && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 h-[300px]">
-          {/* Simulation Controls */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="bg-slate-900/50 border border-slate-800 p-6 rounded-3xl space-y-4">
-            <h3 className="font-bold text-slate-300 uppercase text-xs tracking-widest mb-4">Simulation Environment</h3>
-            <div className="space-y-3">
-              <button 
-                onClick={() => setIsIncomingCall(true)}
-                disabled={isIncomingCall || scamDetected}
-                className="w-full py-3 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-600/30 rounded-xl transition-all flex items-center justify-center gap-2"
-              >
-                Simulate Incoming Call
-              </button>
-              <p className="text-[10px] text-slate-500 text-center">
-                Click above to simulate an incoming call. Try talking like a scammer (e.g. "I am from IRS, give me your OTP") to test detection.
-              </p>
-            </div>
-            
+            <h3 className="font-bold text-slate-300 uppercase text-xs">Simulate</h3>
+            <button 
+              onClick={() => setIsIncomingCall(true)}
+              disabled={isIncomingCall || scamDetected}
+              className="w-full py-3 bg-emerald-600/20 text-emerald-400 border border-emerald-600/30 rounded-xl"
+            >
+              Simulate Incoming Call
+            </button>
             {isIncomingCall && (
-              <div className="p-4 bg-blue-600/10 border border-blue-600/20 rounded-2xl animate-bounce">
-                 <div className="flex items-center justify-between">
-                    <span className="text-sm font-bold text-blue-400">INCOMING CALL...</span>
-                    <button onClick={() => setIsIncomingCall(false)} className="text-[10px] text-slate-500 underline">End Sim</button>
-                 </div>
-                 <p className="text-xs text-slate-400 mt-2">The AI is currently analyzing your voice for vishing patterns.</p>
+              <div className="p-4 bg-blue-600/10 border border-blue-600/20 rounded-2xl animate-bounce text-center">
+                <span className="text-sm font-bold text-blue-400 italic">CALL IN PROGRESS...</span>
               </div>
             )}
           </div>
 
-          {/* Real-time Transcription Log */}
-          <div className="bg-slate-950 border border-slate-800 p-6 rounded-3xl flex flex-col">
-            <h3 className="font-bold text-slate-300 uppercase text-xs tracking-widest mb-4">Neural Transcription Log</h3>
-            <div className="flex-1 overflow-y-auto space-y-2 mono text-xs text-slate-400">
-              {transcription.length === 0 ? (
-                <p className="opacity-30 italic">No audio detected yet...</p>
-              ) : (
-                transcription.map((line, i) => (
-                  <div key={i} className="animate-in slide-in-from-left-2 fade-in">
-                    <span className="text-blue-500/50">[{new Date().toLocaleTimeString([], {hour12: false})}]</span> {line}
-                  </div>
-                ))
-              )}
+          <div className="bg-slate-950 border border-slate-800 p-6 rounded-3xl flex flex-col h-[250px]">
+            <h3 className="font-bold text-slate-300 uppercase text-xs mb-4">Transcription Log</h3>
+            <div className="flex-1 overflow-y-auto space-y-2 text-xs text-slate-400 font-mono">
+              {transcription.map((line, i) => (
+                <div key={i} className="border-l border-blue-500/30 pl-2">{line}</div>
+              ))}
             </div>
           </div>
         </div>
       )}
 
-      {/* Red Alert Modal */}
       {scamDetected && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/90 backdrop-blur-md animate-in fade-in duration-300">
-          <div className="bg-rose-950 border-4 border-rose-600 p-10 rounded-[40px] max-w-lg w-full text-center space-y-8 shadow-[0_0_100px_rgba(225,29,72,0.4)] animate-in zoom-in duration-300">
-            <div className="w-24 h-24 bg-rose-600 rounded-full flex items-center justify-center mx-auto animate-bounce">
-              <AlertIcon className="w-16 h-16 text-white" />
-            </div>
-            <div className="space-y-4">
-              <h2 className="text-5xl font-black text-white uppercase tracking-tighter italic">Scam Detected</h2>
-              <p className="text-rose-200 text-lg">
-                PhishGuard AI intercepted a high-risk voice pattern associated with <strong>Credential Harvesting</strong>.
-              </p>
-              <div className="bg-rose-900/50 p-4 rounded-2xl border border-rose-600/30">
-                <span className="text-sm font-bold uppercase tracking-widest text-rose-300 block mb-1">System Action</span>
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/90 backdrop-blur-md">
+          <div className="bg-rose-950 border-4 border-rose-600 p-10 rounded-[40px] max-w-lg text-center space-y-8 shadow-2xl">
+            <AlertIcon className="w-16 h-16 text-white mx-auto animate-bounce" />
+            <h2 className="text-4xl font-black text-white">SCAM DETECTED</h2>
+            <div className="bg-rose-900/50 p-4 rounded-2xl border border-rose-600/30">
                 <span className="text-2xl font-black text-white">CALL TERMINATED</span>
-              </div>
             </div>
-            <button 
-              onClick={() => setScamDetected(false)}
-              className="w-full py-4 bg-white text-rose-900 rounded-2xl font-black text-xl hover:bg-rose-100 transition-all shadow-xl"
-            >
-              DISMISS ALERT
+            <button onClick={() => setScamDetected(false)} className="w-full py-4 bg-white text-rose-900 rounded-2xl font-black">
+              DISMISS
             </button>
           </div>
         </div>
